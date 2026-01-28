@@ -1,0 +1,129 @@
+name: Sync DO Deploy Logs to Gist
+
+on:
+  schedule:
+    # Run every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync-logs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fetch DO Logs and Update Gist
+        env:
+          DO_API_TOKEN: ${{ secrets.DO_API_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GIST_TOKEN }}
+          DO_APP_ID: "1fd40be5-b9af-4e71-ab1d-3af0864a7da4"
+          GIST_ID: "476cdd17d06727172f0190057683f046"
+        run: |
+          set -e
+
+          echo "=== Fetching DO App Info ==="
+          APP_INFO=$(curl -s -X GET \
+            -H "Authorization: Bearer $DO_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.digitalocean.com/v2/apps/$DO_APP_ID")
+
+          APP_NAME=$(echo "$APP_INFO" | jq -r '.app.spec.name // "Unknown"')
+          LIVE_URL=$(echo "$APP_INFO" | jq -r '.app.live_url // "N/A"')
+
+          echo "App: $APP_NAME"
+          echo "Live URL: $LIVE_URL"
+
+          echo "=== Fetching Latest Deployment ==="
+          DEPLOYMENTS=$(curl -s -X GET \
+            -H "Authorization: Bearer $DO_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.digitalocean.com/v2/apps/$DO_APP_ID/deployments?per_page=1")
+
+          DEPLOY_ID=$(echo "$DEPLOYMENTS" | jq -r '.deployments[0].id // "N/A"')
+          DEPLOY_PHASE=$(echo "$DEPLOYMENTS" | jq -r '.deployments[0].phase // "N/A"')
+          DEPLOY_CREATED=$(echo "$DEPLOYMENTS" | jq -r '.deployments[0].created_at // "N/A"')
+          DEPLOY_UPDATED=$(echo "$DEPLOYMENTS" | jq -r '.deployments[0].updated_at // "N/A"')
+          DEPLOY_CAUSE=$(echo "$DEPLOYMENTS" | jq -r '.deployments[0].cause // "N/A"')
+
+          echo "Latest deployment: $DEPLOY_ID ($DEPLOY_PHASE)"
+
+          echo "=== Fetching Runtime Logs ==="
+          LOGS_RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer $DO_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.digitalocean.com/v2/apps/$DO_APP_ID/logs?type=RUN&follow=false")
+
+          LIVE_URL_LOGS=$(echo "$LOGS_RESPONSE" | jq -r '.live_url // empty')
+
+          RUNTIME_LOGS="No runtime logs available"
+          if [ -n "$LIVE_URL_LOGS" ]; then
+            RUNTIME_LOGS=$(curl -s "$LIVE_URL_LOGS" 2>/dev/null | head -500 || echo "Failed to fetch logs")
+          fi
+
+          echo "=== Fetching Build Logs ==="
+          BUILD_RESPONSE=$(curl -s -X GET \
+            -H "Authorization: Bearer $DO_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.digitalocean.com/v2/apps/$DO_APP_ID/logs?type=BUILD&follow=false")
+
+          BUILD_URL=$(echo "$BUILD_RESPONSE" | jq -r '.live_url // empty')
+
+          BUILD_LOGS="No build logs available"
+          if [ -n "$BUILD_URL" ]; then
+            BUILD_LOGS=$(curl -s "$BUILD_URL" 2>/dev/null | head -500 || echo "Failed to fetch logs")
+          fi
+
+          echo "=== Building Gist Content ==="
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          CONTENT=$(cat <<EOFCONTENT
+          # DigitalOcean Deploy Logs
+          # App: $APP_NAME
+          # App ID: $DO_APP_ID
+          # Live URL: $LIVE_URL
+          # Last Updated: $TIMESTAMP
+          #
+          # RAW URL FOR MANUS:
+          # https://gist.githubusercontent.com/EvanTenenbaum/$GIST_ID/raw/do-deploy-logs.txt
+
+          ========================================
+          LATEST DEPLOYMENT
+          ========================================
+          Deployment ID: $DEPLOY_ID
+          Phase: $DEPLOY_PHASE
+          Created: $DEPLOY_CREATED
+          Updated: $DEPLOY_UPDATED
+          Cause: $DEPLOY_CAUSE
+
+          ========================================
+          RUNTIME LOGS (last 500 lines)
+          ========================================
+          $RUNTIME_LOGS
+
+          ========================================
+          BUILD LOGS (last 500 lines)
+          ========================================
+          $BUILD_LOGS
+          EOFCONTENT
+          )
+
+          echo "=== Updating Gist ==="
+          # Escape content for JSON
+          ESCAPED_CONTENT=$(echo "$CONTENT" | jq -Rs .)
+
+          GIST_RESPONSE=$(curl -s -X PATCH \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/gists/$GIST_ID" \
+            -d "{\"files\":{\"do-deploy-logs.txt\":{\"content\":$ESCAPED_CONTENT}}}")
+
+          GIST_URL=$(echo "$GIST_RESPONSE" | jq -r '.html_url // empty')
+
+          if [ -n "$GIST_URL" ]; then
+            echo "✅ Gist updated successfully!"
+            echo "Gist URL: $GIST_URL"
+          else
+            echo "❌ Failed to update gist"
+            echo "$GIST_RESPONSE"
+            exit 1
+          fi
